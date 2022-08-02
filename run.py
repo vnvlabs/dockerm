@@ -2,6 +2,8 @@
 import argparse
 import base64
 import json
+import os
+import shutil
 import sys
 import threading
 import time
@@ -10,7 +12,6 @@ import uuid
 import requests
 from flask import Blueprint, request, make_response, jsonify, g, Flask, current_app
 import docker
-
 
 blueprint = Blueprint(
     'base',
@@ -24,10 +25,13 @@ DEFAULT_IMAGES = []
 DEFAULT_RESOURCES = []
 DOCKER_PRIVATE_IMAGE_REPO = "ghcr.io/private/vnv-private-images"
 
-IMAGE_PORT = 5001
+# This is the port the GUI runs on -- It hardcoded into the launch.sh script of the gui
+# server, so dont change it.
+IMAGE_PORT = 5000
 
 # Little cache to keep state in while we update stuff.
 CONTAINER_CACHE = {}
+
 
 def benc(msg):
     message_bytes = msg.encode('ascii')
@@ -55,13 +59,16 @@ class Container:
     def status(self):
         if self.dstatus == "RUNNING":
             try:
-                a =  ContainerImplementation.docker_client.containers.get(self.id)
+                a = ContainerImplementation.docker_client.containers.get(self.id)
                 if a is not None:
                     return a.status
-            except:
+                print("Not Found" , self.id)
+            except Exception as e:
+                print(e)
                 pass
 
             return "Launching Container"
+
         return self.dstatus
 
     def to_json(self):
@@ -72,9 +79,9 @@ class Container:
             "repo": self.repo,
             "tag": self.tag,
             "code": self.code,
-            "status" : self.status(),
+            "status": self.status(),
             "description": self.desc
-    }
+        }
 
     @staticmethod
     def from_json(j):
@@ -88,9 +95,7 @@ class Container:
                          )
 
 
-
 class ContainerImplementation:
-
     docker_client = docker.from_env()
 
     @classmethod
@@ -122,14 +127,14 @@ class ContainerImplementation:
         return None
 
     @classmethod
-    def get_docker_container(cls,container_id):
+    def get_docker_container(cls, container_id):
         try:
             return cls.docker_client.containers.get(container_id)
         except:
             return None
 
     @classmethod
-    def create_(cls, container, cookie, imageKwargs):
+    def create_(cls, container, imageKwargs, config):
 
         try:
             gui_code = uuid.uuid4().hex
@@ -137,27 +142,35 @@ class ContainerImplementation:
 
             image = cls.get_image(repo=container.repo, tag=container.tag, **imageKwargs)
 
+
+
             if image is not None:
-                labels = {
-                    "vnv-container-info" : json.dumps(container.to_json()),
-                    "vnv-gui-code" : gui_code,
-                }
+                volumes = {}
+                ssl_opts = ""
+                if config["SSL"]:
+                    volumes[config.SSL_DIR] : {'bind': config.SSL_DIR, "mode": "ro"}
+                    ssl_opts = f"--ssl 1 --ssl_cert {config.SSLCTX[0]} --ssl_key {config.SSLCTX[1]}"
 
-                cls.docker_client.containers.run(f"{container.repo}:{container.tag}",
-                                                 command=f"/vnv-gui/launch.sh {IMAGE_PORT} {container.code} {cookie}",
-                                                 labels=labels,
-                                                 name=container.id,
-                                                 ports={ IMAGE_PORT: None },
-                                                 detach=True)
+                opts = dict(
+                    command=f"/vnv-gui/launch.sh --code {container.code} {ssl_opts}",
+                    labels={
+                        "vnv-container-info": json.dumps(container.to_json()),
+                        "vnv-gui-code": gui_code,
+                    },
+                    volumes=volumes,
+                    name=container.id,
+                    ports={5000: None},
+                    detach=True
+                )
 
-
+                cls.docker_client.containers.run(f"{container.repo}:{container.tag}", **opts)
 
         except Exception as e:
             print(e)
             pass
 
     @classmethod
-    def stop_(cls, container_id,uid):
+    def stop_(cls, container_id, uid):
         c = cls.get_container(container_id, uid)
         if c is not None:
             dc = cls.get_docker_container(c)
@@ -176,7 +189,6 @@ class ContainerImplementation:
                 return True
         return False
 
-
     @classmethod
     def delete_(cls, container_id, uid):
         c = cls.get_container(container_id, uid)
@@ -184,16 +196,15 @@ class ContainerImplementation:
             a = cls.get_docker_container(c)
             if a is not None:
                 a.stop(timeout=0)
-                a.remove(force=True,v=False)
+                a.remove(force=True, v=False)
                 return True
         return False
-
 
     @classmethod
     def snapshot_(cls, container_id, uid, kwargs):
         c = cls.get_container(container_id, uid)
         repo = kwargs.pop("repo")
-        tag = kwargs.pop("tag",None)
+        tag = kwargs.pop("tag", None)
         if c is not None:
             newlabel = 'LABEL vnv-container-info=""\nLABEL vnv-gui-code=""'
             a = cls.get_docker_container(c)
@@ -210,7 +221,8 @@ class ContainerImplementation:
         if c is not None:
             container = cls.get_docker_container(container_id)
             if container is not None:
-               return container.ports[f"{IMAGE_PORT}/tcp"][0]["HostPort"], {"vnv-gui-code" : container.labels["vnv-gui-code"] }
+                return container.ports[f"{IMAGE_PORT}/tcp"][0]["HostPort"], {
+                    "vnv-gui-code": container.labels["vnv-gui-code"]}
         return None, None
 
     @classmethod
@@ -225,18 +237,19 @@ class ContainerImplementation:
         return containers
 
 
-
 @blueprint.before_request
 def check_valid_login():
     g.user = request.cookies.get("vnv-resource-user")
-    return ####DEBUG
+    return  ####DEBUG
     g.user = request.cookies.get("vnv-resource-user")
     if g.user is None or request.cookies.get("vnv-resource-auth") != current_app.config["AUTHCODE"]:
         return make_response("Error", 201)
 
+
 @blueprint.route("/ready", methods=["GET"])
 def ready():
-    return make_response("",200)
+    return make_response("", 200)
+
 
 # Return a list of containers and their status.
 @blueprint.route('/list', methods=["GET"])
@@ -253,14 +266,15 @@ def create_container():
         container_id = j["cid"]
         repo = j.pop("repo")
         tag = j.pop("tag", "latest")
-        name = j.pop("name","Untitled")
-        desc = j.pop("desc","No Description")
-        extra = j.pop("extra",{})
+        name = j.pop("name", "Untitled")
+        desc = j.pop("desc", "No Description")
+        extra = j.pop("extra", {})
 
         container = Container(container_id, g.user, name=name, repo=repo, desc=desc, tag=tag)
         CONTAINER_CACHE[container_id] = container
 
-        threading.Thread(target=ContainerImplementation.create_, args=[container, current_app.config["LOGOUT_COOKIE"], extra]).start()
+        threading.Thread(target=ContainerImplementation.create_,
+                         args=[container,  extra, current_app.config ]).start()
         return make_response(container_id, 200)
     except Exception as e:
         return make_response("invalid container config" + str(e), 400)
@@ -301,7 +315,7 @@ def get_container_port(cid):
     try:
 
         port, cookies = ContainerImplementation.port_and_code(cid, g.user)
-        return make_response(jsonify({"port" : port, "cookies" : cookies }) , 200)
+        return make_response(jsonify({"port": port, "cookies": cookies}), 200)
     except:
         pass
 
@@ -323,7 +337,11 @@ class Config:
     port = 5010
     HOST = "0.0.0.0"
     AUTHCODE = "secret"
-    LOGOUT_COOKIE="vnvnginxcode"
+    LOGOUT_COOKIE = "vnvnginxcode"
+
+    SSL = False
+    SSL_DIR = "tmp_ssl_dir"
+    SSLCTX = (os.path.join(SSL_DIR, "cert.crt"), os.path.join(SSL_DIR, "cert.key"))
 
 
 ContainerImplementation.load_all()
@@ -336,16 +354,33 @@ if __name__ == "__main__":
     parser.add_argument("--host", help="host to run on (default localhost)", default="0.0.0.0")
     parser.add_argument("--code", type=str, help="authorization-code", default="secret")
     parser.add_argument("--logout", help="name of logout cookie", default="vnvnginxcookie")
+    parser.add_argument("--ssl", type=bool, help="should we use ssl", default=False)
+    parser.add_argument("--ssl_cert", type=str, help="file containing the ssl cert", default=None)
+    parser.add_argument("--ssl_key", type=str, help="file containing the ssl cert key", default=None)
 
     args = parser.parse_args()
     Config.port = args.port
     Config.HOST = args.host
     Config.AUTHCODE = args.code
     Config.LOGOUT_COOKIE = args.logout
+    Config.SSL = args.ssl
 
     app = Flask(__name__, static_folder="static")
     app.config.from_object(app_config)
     app.register_blueprint(blueprint)
-    app.run(use_reloader=False, host=app_config.HOST, port=app_config.port)
 
+    opts = {
+        "use_reloader": False,
+        "host": app_config.HOST,
+        "port": app_config.port
+    }
 
+    if args.ssl:
+
+        if not os.path.exists(Config.SSL_DIR):
+            os.mkdir(Config.SSL_DIR)
+        shutil.copy(args.ssl_cert, Config.SSLCTX[0])
+        shutil.copy(args.ssl_key, Config.SSLCTX[1])
+        opts["ssl_context"] = Config.SSLCTX
+
+    app.run(**opts)
