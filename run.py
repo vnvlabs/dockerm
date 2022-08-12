@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import uuid
+from io import StringIO, BytesIO
 
 import requests
 from flask import Blueprint, request, make_response, jsonify, g, Flask, current_app
@@ -108,7 +109,6 @@ class ContainerImplementation:
                 cont.port = container.ports[f"{IMAGE_PORT}/tcp"][0]["HostPort"]
                 cont.code = container.labels["vnv-gui-code"]
                 cont.dstatus = "RUNNING"
-                cont.status()
                 CONTAINER_CACHE[cont.id] = cont
 
             except:
@@ -143,30 +143,56 @@ class ContainerImplementation:
             image = cls.get_image(repo=container.repo, tag=container.tag, **imageKwargs)
 
 
-
             if image is not None:
-                volumes = {}
+
+                run_image = f"{container.repo}:{container.tag}"
                 ssl_opts = ""
-                if config["SSL"]:
-                    volumes[config.SSL_DIR] : {'bind': config.SSL_DIR, "mode": "ro"}
-                    ssl_opts = f"--ssl 1 --ssl_cert {config.SSLCTX[0]} --ssl_key {config.SSLCTX[1]}"
+
+                if config['SSL']:
+                    image = container.repo + (":" + container.tag) if container.tag is not None else ""
+                    with open(os.path.abspath(config["SSLCTX"][0])) as f:
+                        crt = f.readlines()
+                    with open(os.path.abspath(config["SSLCTX"][1])) as f:
+                        key = f.readlines()
+
+                    s = BytesIO()
+                    ss = "from " + image + "\n"
+                    s.write(str.encode(ss))
+                    s.write(b"run mkdir -p /certs\n")
+                    s.write(b"run echo '\\\n")
+                    for i in crt:
+                        ss = i.strip() + "\\n\\\n"
+                        s.write(str.encode(ss))
+                    s.write(b"' > /certs/cert.crt\n")
+                    s.write(b"run echo '\\\n")
+                    for i in key:
+                        ss = i.strip() + "\\n\\\n"
+                        s.write(str.encode(ss))
+                    s.write(b"' > /certs/cert.key\n")
+
+                    run_image = f"vci-{container.id}"
+                    ssl_opts = f" --ssl 1 --ssl_cert /certs/cert.crt --ssl_key /certs/cert.key"
+                    cls.docker_client.images.build(fileobj=s, tag=run_image)
+
 
                 opts = dict(
-                    command=f"/vnv-gui/launch.sh --code {container.code} {ssl_opts}",
+                    command=f"/vnv-gui/launch.sh --code {container.code} {ssl_opts} ",
                     labels={
                         "vnv-container-info": json.dumps(container.to_json()),
                         "vnv-gui-code": gui_code,
                     },
-                    volumes=volumes,
                     name=container.id,
                     ports={5000: None},
                     detach=True
                 )
 
-                cls.docker_client.containers.run(f"{container.repo}:{container.tag}", **opts)
+                if len( config["DATABASE"]) > 0:
+                    opts["volumes"] = [config["DATABASE"]]
+
+                cls.docker_client.containers.run(run_image, **opts)
 
         except Exception as e:
-            print(e)
+            printI(e)
             pass
 
     @classmethod
@@ -258,6 +284,10 @@ def container_management():
     r = [c.to_json() for c in containers]
     return make_response(jsonify(r), 200)
 
+def printI(m):
+    with open('fff','a') as f:
+        f.write(m)
+
 
 @blueprint.route('/create', methods=["POST"])
 def create_container():
@@ -275,6 +305,7 @@ def create_container():
 
         threading.Thread(target=ContainerImplementation.create_,
                          args=[container,  extra, current_app.config ]).start()
+
         return make_response(container_id, 200)
     except Exception as e:
         return make_response("invalid container config" + str(e), 400)
@@ -333,21 +364,20 @@ def create_image(cid):
 
 
 class Config:
+
     DEBUG = False
     port = 5010
     HOST = "0.0.0.0"
     AUTHCODE = "secret"
     LOGOUT_COOKIE = "vnvnginxcode"
-
     SSL = False
     SSL_DIR = "tmp_ssl_dir"
     SSLCTX = (os.path.join(SSL_DIR, "cert.crt"), os.path.join(SSL_DIR, "cert.key"))
-
+    DATABASE = ""
 
 ContainerImplementation.load_all()
 
 if __name__ == "__main__":
-    app_config = Config()
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, help="port to run on (default 5001)", default=5000)
@@ -355,6 +385,7 @@ if __name__ == "__main__":
     parser.add_argument("--code", type=str, help="authorization-code", default="secret")
     parser.add_argument("--logout", help="name of logout cookie", default="vnvnginxcookie")
     parser.add_argument("--ssl", type=bool, help="should we use ssl", default=False)
+    parser.add_argument("--database", type=str, help="database mounting url for launching docker containers.", default="")
     parser.add_argument("--ssl_cert", type=str, help="file containing the ssl cert", default=None)
     parser.add_argument("--ssl_key", type=str, help="file containing the ssl cert key", default=None)
 
@@ -364,6 +395,9 @@ if __name__ == "__main__":
     Config.AUTHCODE = args.code
     Config.LOGOUT_COOKIE = args.logout
     Config.SSL = args.ssl
+    Config.DATABASE = args.database
+
+    app_config = Config()
 
     app = Flask(__name__, static_folder="static")
     app.config.from_object(app_config)
