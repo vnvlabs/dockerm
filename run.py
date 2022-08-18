@@ -26,6 +26,7 @@ DEFAULT_IMAGES = []
 DEFAULT_RESOURCES = []
 DOCKER_PRIVATE_IMAGE_REPO = "ghcr.io/private/vnv-private-images"
 
+REFS = {}
 # This is the port the GUI runs on -- It hardcoded into the launch.sh script of the gui
 # server, so dont change it.
 IMAGE_PORT = 5000
@@ -47,28 +48,28 @@ def bdec(msg):
 
 
 class Container:
-    def __init__(self, id, user, name, repo, desc, code=uuid.uuid4().hex, tag="latest", status="RUNNING"):
+    def __init__(self, id, user, name, repo, desc, code=uuid.uuid4().hex, tag="latest", dstatus="CHECK", error=""):
         self.id = id
         self.user = user
         self.name = name
         self.repo = repo
         self.tag = tag
         self.desc = desc
-        self.dstatus = status
+        self.dstatus = dstatus
         self.code = code
+        self.error = error
 
     def status(self):
-        if self.dstatus == "RUNNING":
+        if self.dstatus == "CHECK":
             try:
                 a = ContainerImplementation.docker_client.containers.get(self.id)
                 if a is not None:
-                    return a.status
-                print("Not Found" , self.id)
+                    return a.status #  created, restarting, running, removing, paused, exited, dead
+
             except Exception as e:
-                print(e)
                 pass
 
-            return "Launching Container"
+            return "error"
 
         return self.dstatus
 
@@ -80,8 +81,10 @@ class Container:
             "repo": self.repo,
             "tag": self.tag,
             "code": self.code,
+            "dstatus": self.dstatus,
             "status": self.status(),
-            "description": self.desc
+            "description": self.desc,
+            "error" : self.error
         }
 
     @staticmethod
@@ -92,7 +95,9 @@ class Container:
                          repo=j["repo"],
                          tag=j["tag"],
                          code=j["code"],
+                         dstatus = j["dstatus"],
                          desc=j["description"],
+                         error=j["error"]
                          )
 
 
@@ -108,7 +113,7 @@ class ContainerImplementation:
                 cont = Container.from_json(inf)
                 cont.port = container.ports[f"{IMAGE_PORT}/tcp"][0]["HostPort"]
                 cont.code = container.labels["vnv-gui-code"]
-                cont.dstatus = "RUNNING"
+                cont.dstatus = "CHECK"
                 CONTAINER_CACHE[cont.id] = cont
 
             except:
@@ -116,7 +121,15 @@ class ContainerImplementation:
 
     @classmethod
     def get_image(cls, repo, tag, **kwargs):
-        return cls.docker_client.images.pull(repository=repo, tag=tag, **kwargs)
+
+        if "private" in kwargs and kwargs["private"]:
+            auth_config = {
+                "username" :kwargs.get("username"),
+                "password" : kwargs.get("passw")
+            }
+            return cls.docker_client.images.pull(repository=repo, tag=tag, auth_config=auth_config)
+
+        return cls.docker_client.images.pull(repository=repo, tag=tag)
 
     @classmethod
     def get_container(cls, container_id, uid):
@@ -139,12 +152,14 @@ class ContainerImplementation:
         try:
             gui_code = uuid.uuid4().hex
             container.code = gui_code
-
-            image = cls.get_image(repo=container.repo, tag=container.tag, **imageKwargs)
-
+            container.error = "Downloading Image"
+            try:
+                image = cls.get_image(repo=container.repo, tag=container.tag, **imageKwargs)
+            except:
+                image = None
 
             if image is not None:
-
+                container.error = "Configuring Container"
                 run_image = f"{container.repo}:{container.tag}"
                 ssl_opts = ""
 
@@ -189,55 +204,112 @@ class ContainerImplementation:
                 if len( config["DATABASE"]) > 0:
                     opts["volumes"] = [config["DATABASE"]]
 
+                container.error = "Launching Container"
                 cls.docker_client.containers.run(run_image, **opts)
+                container.error = ""
+                container.dstatus = "CHECK"
+            else:
+                container.dstatus = "error"
+                container.error = "Image not found"
 
         except Exception as e:
-            printI(e)
-            pass
+            container.dstatus = "error"
+            container.error = str(e)
 
     @classmethod
     def stop_(cls, container_id, uid):
+      try:
         c = cls.get_container(container_id, uid)
         if c is not None:
-            dc = cls.get_docker_container(c)
-            if dc is not None:
-                dc.stop(timeout=0)
-                return True
+            try:
+                dc = cls.get_docker_container(container_id)
+                if dc is not None:
+                    dc.stop(timeout=0)
+                    c.error = ""
+                    c.dstatus = "CHECK"
+                    return True
+            except:
+                pass
+
+            c.error="Could Not Stop Container."
+            c.dstatus = "CHECK"
         return False
+      except Exception as e:
+          printI(str(e))
 
     @classmethod
     def start_(cls, container_id, uid):
         c = cls.get_container(container_id, uid)
         if c is not None:
-            dc = cls.get_docker_container(c)
-            if dc is not None:
-                dc.start()
-                return True
+            try:
+                dc = cls.get_docker_container(container_id)
+                if dc is not None:
+                    dc.start()
+                    c.dstatus = "CHECK"
+                    c.error = ""
+                    return True
+            except:
+                pass
+
+            c.error = "Could not start container"
+            c.dstatus = "CHECK"
         return False
 
     @classmethod
     def delete_(cls, container_id, uid):
         c = cls.get_container(container_id, uid)
         if c is not None:
-            a = cls.get_docker_container(c)
-            if a is not None:
-                a.stop(timeout=0)
-                a.remove(force=True, v=False)
-                return True
+            try:
+                a = cls.get_docker_container(container_id)
+                if a is not None:
+                    a.stop(timeout=0)
+                    a.remove(force=True, v=False)
+                    CONTAINER_CACHE.pop(container_id)
+                    return True
+            except:
+                pass
+
+            c.dstatus = "CHECK"
+            c.error = "Could not delete container"
         return False
 
     @classmethod
-    def snapshot_(cls, container_id, uid, kwargs):
+    def snapshot_(cls,ref, container_id, uid, kwargs):
         c = cls.get_container(container_id, uid)
-        repo = kwargs.pop("repo")
+        repo = kwargs.pop("repo",None)
         tag = kwargs.pop("tag", None)
-        if c is not None:
-            newlabel = 'LABEL vnv-container-info=""\nLABEL vnv-gui-code=""'
-            a = cls.get_docker_container(c)
-            if a is not None:
+        if c is None or repo is None or tag is None:
+            REFS[ref] = "Invalid Repo,tag or container"
+            return
+
+        if "username" not in kwargs or "password" not in kwargs:
+            REFS[ref] = "Please provide a username and password"
+
+        newlabel = 'LABEL vnv-container-info=""\nLABEL vnv-gui-code=""'
+        a = cls.get_docker_container(container_id)
+        if a is not None:
+            try:
                 a.commit(repo, tag=tag, changes=newlabel)
-                cls.docker_client.push(repo, tag=tag, **kwargs)
+                a = cls.docker_client.images.push(repo, tag=tag, auth_config={
+                    "username": kwargs.get("username"),
+                    "password": kwargs.get("password")
+                }, decode = True, stream=True)
+
+                success = True
+                REFS[ref] = "Pending"
+                for i in a:
+                    if "errorDetail" in i:
+                        REFS[ref] = "Failed: " + i["errorDetail"]["message"]
+                        success=False
+                if success:
+                    REFS[ref] = "Success"
+
                 return True
+            except Exception as e:
+                REFS[ref] = "Snapshot Failed because " + str(e)
+                return False
+
+        REFS[ref] = "Could not find contanier to snapshot"
         return False
 
     @classmethod
@@ -298,11 +370,17 @@ def create_container():
         tag = j.pop("tag", "latest")
         name = j.pop("name", "Untitled")
         desc = j.pop("desc", "No Description")
-        extra = j.pop("extra", {})
+
+
+        extra = dict(
+            private=j.get("private", False),
+            username = j.get("username", None),
+            password = j.get("password", None)
+        )
 
         container = Container(container_id, g.user, name=name, repo=repo, desc=desc, tag=tag)
         CONTAINER_CACHE[container_id] = container
-
+        container.dstatus = "creating"
         threading.Thread(target=ContainerImplementation.create_,
                          args=[container,  extra, current_app.config ]).start()
 
@@ -313,34 +391,47 @@ def create_container():
 
 @blueprint.route('/stop/<cid>', methods=["POST"])
 def stop_container(cid):
-    try:
-        CONTAINER_CACHE[cid].dstatus = "Stopped"
-        threading.Thread(target=ContainerImplementation.stop_, args=[cid, g.user]).start()
-        return make_response("", 200)
-    except:
-        return make_response("", 201)
+    container = CONTAINER_CACHE.get(cid)
+    if container is not None and container.user == g.user:
+        try:
+            container.dstatus = "stopping"
+            threading.Thread(target=ContainerImplementation.stop_, args=[cid, g.user]).start()
+            return make_response("", 200)
+        except:
+            pass
+
+    return make_response("", 201)
 
 
 @blueprint.route('/start/<cid>', methods=["POST"])
 def start_container(cid):
-    try:
-        CONTAINER_CACHE[cid].dstatus = "RUNNING"
-        threading.Thread(target=ContainerImplementation.start_, args=[cid, g.user]).start()
-        return make_response("", 200)
-    except:
-        return make_response("", 201)
+    container = CONTAINER_CACHE.get(cid)
+    if container is not None and container.user == g.user:
+        try:
+            CONTAINER_CACHE[cid].dstatus = "starting"
+            threading.Thread(target=ContainerImplementation.start_, args=[cid, g.user]).start()
+            return make_response("", 200)
+        except:
+            pass
+    return make_response("", 201)
 
 
 @blueprint.route('/delete/<cid>', methods=["POST"])
 def delete_container(cid):
     try:
-        CONTAINER_CACHE.pop(cid)
-        threading.Thread(target=ContainerImplementation.delete_, args=[cid, g.user]).start()
-        return make_response("", 200)
+        container = CONTAINER_CACHE.get(cid)
+        if container is not None and container.user == g.user:
+            container.dstatus = "deleting"
+            threading.Thread(target=ContainerImplementation.delete_, args=[cid, g.user]).start()
+            return make_response("", 200)
     except:
-        return make_response("", 201)
+        pass
 
+    return make_response("", 201)
 
+@blueprint.route('/ref/<cid>', methods=["POST"])
+def get_ref(cid):
+    return make_response(REFS.get(cid,"Not Found"),200)
 @blueprint.route('/port/<cid>', methods=["POST"])
 def get_container_port(cid):
     try:
@@ -357,8 +448,10 @@ def get_container_port(cid):
 def create_image(cid):
     try:
         j = request.get_json()
-        threading.Thread(target=ContainerImplementation.snapshot_, args=[cid, g.user, j]).start()
-        return make_response("", 200)
+        ref = uuid.uuid4().hex
+        REFS[ref] = "Starting Snapshot"
+        threading.Thread(target=ContainerImplementation.snapshot_, args=[ref, cid, g.user, j]).start()
+        return make_response(ref, 200)
     except:
         return make_response("", 201)
 
