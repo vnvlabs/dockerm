@@ -191,7 +191,7 @@ class ContainerImplementation:
 
 
                 opts = dict(
-                    command=f"/vnv-gui/launch.sh --code {container.code} {ssl_opts} ",
+                    command=f"/vnv-gui/launch.sh --code {container.code} --wspath {config['WSPATH']} {ssl_opts} ",
                     labels={
                         "vnv-container-info": json.dumps(container.to_json()),
                         "vnv-gui-code": gui_code,
@@ -467,6 +467,8 @@ class Config:
     SSL_DIR = "tmp_ssl_dir"
     SSLCTX = (os.path.join(SSL_DIR, "cert.crt"), os.path.join(SSL_DIR, "cert.key"))
     DATABASE = ""
+    WSPATH = "wss://vnvlabs.com"
+
 
 ContainerImplementation.load_all()
 
@@ -481,6 +483,8 @@ if __name__ == "__main__":
     parser.add_argument("--database", type=str, help="database mounting url for launching docker containers.", default="")
     parser.add_argument("--ssl_cert", type=str, help="file containing the ssl cert", default=None)
     parser.add_argument("--ssl_key", type=str, help="file containing the ssl cert key", default=None)
+    parser.add_argument("--wspath", type=str, help="web socket path ", default="wss://vnvlabs.com")
+
 
     args = parser.parse_args()
     Config.port = args.port
@@ -489,6 +493,7 @@ if __name__ == "__main__":
     Config.LOGOUT_COOKIE = args.logout
     Config.SSL = args.ssl
     Config.DATABASE = args.database
+    Config.WSPATH = args.wspath
 
     app_config = Config()
 
