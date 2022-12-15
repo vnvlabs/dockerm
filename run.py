@@ -189,9 +189,15 @@ class ContainerImplementation:
                     ssl_opts = f" --ssl 1 --ssl_cert /certs/cert.crt --ssl_key /certs/cert.key"
                     cls.docker_client.images.build(fileobj=s, tag=run_image)
 
-
+                wsp = ""
+                if config["WSPATH"] is not None:
+                    wsp = "--wspath " + config["WSPATH"] + " "
+                
+                if config["THEIAPATH"] is not None:
+                    wsp += "--theiapath" + config["THEIAPATH"] + " "   
+ 
                 opts = dict(
-                    command=f"/vnv-gui/launch.sh --code {container.code} {ssl_opts} ",
+                    command=f"/vnv-gui/launch.sh --code {container.code} {wsp} {ssl_opts} ",
                     labels={
                         "vnv-container-info": json.dumps(container.to_json()),
                         "vnv-gui-code": gui_code,
@@ -467,6 +473,8 @@ class Config:
     SSL_DIR = "tmp_ssl_dir"
     SSLCTX = (os.path.join(SSL_DIR, "cert.crt"), os.path.join(SSL_DIR, "cert.key"))
     DATABASE = ""
+    WSPATH = None
+    THEIAPATH = None
 
 ContainerImplementation.load_all()
 
@@ -481,6 +489,8 @@ if __name__ == "__main__":
     parser.add_argument("--database", type=str, help="database mounting url for launching docker containers.", default="")
     parser.add_argument("--ssl_cert", type=str, help="file containing the ssl cert", default=None)
     parser.add_argument("--ssl_key", type=str, help="file containing the ssl cert key", default=None)
+    parser.add_argument("--wspath", type=str, help="web socket path", default=None)
+    parser.add_argument("--theiapath", type=str, help="web socket path", default=None)
 
     args = parser.parse_args()
     Config.port = args.port
@@ -489,6 +499,13 @@ if __name__ == "__main__":
     Config.LOGOUT_COOKIE = args.logout
     Config.SSL = args.ssl
     Config.DATABASE = args.database
+    
+    if args.wspath:
+        Config.WSPATH = args.wspath
+
+    if args.theiapath:
+        Config.THEIAPATH = args.theiapath
+    
 
     app_config = Config()
 
