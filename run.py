@@ -46,7 +46,7 @@ def bdec(msg):
 
 
 class Container:
-    def __init__(self, id, user, name, repo, desc, code=uuid.uuid4().hex, tag="latest", dstatus="CHECK", error=""):
+    def __init__(self, id, user, name, repo, desc, code=None, tag="latest", dstatus="CHECK", error=""):
         self.id = id
         self.user = user
         self.name = name
@@ -54,7 +54,7 @@ class Container:
         self.tag = tag
         self.desc = desc
         self.dstatus = dstatus
-        self.code = code
+        self.code = code if code is not None else uuid.uuid4().hex
         self.error = error
 
     def status(self):
@@ -120,15 +120,18 @@ class ContainerImplementation:
 
     @classmethod
     def get_image(cls, repo, tag, **kwargs):
+        try:
+            if "private" in kwargs and kwargs["private"]:
+                auth_config = {
+                    "username" :kwargs.get("username"),
+                    "password" : kwargs.get("passw")
+                }
+                return cls.docker_client.images.pull(repository=repo, tag=tag, auth_config=auth_config)
 
-        if "private" in kwargs and kwargs["private"]:
-            auth_config = {
-                "username" :kwargs.get("username"),
-                "password" : kwargs.get("passw")
-            }
-            return cls.docker_client.images.pull(repository=repo, tag=tag, auth_config=auth_config)
-
-        return cls.docker_client.images.pull(repository=repo, tag=tag)
+            return cls.docker_client.images.pull(repository=repo, tag=tag)
+        except Exception as e:
+            #Try find it locally.
+            return cls.docker_client.images.get(repo + ":" + (tag if tag is not None else "latest"))
 
     @classmethod
     def get_container(cls, container_id, uid):
@@ -167,8 +170,6 @@ class ContainerImplementation:
     def create_(cls, container, imageKwargs, config):
 
         try:
-            gui_code = uuid.uuid4().hex
-            container.code = gui_code
             container.error = "Downloading Image"
             try:
                 image = cls.get_image(repo=container.repo, tag=container.tag, **imageKwargs)
@@ -226,7 +227,7 @@ class ContainerImplementation:
                     command=f"/vnv-gui/launch.sh --code {container.code} {wsp} {ssl_opts} ",
                     labels={
                         "vnv-container-info": json.dumps(container.to_json()),
-                        "vnv-gui-code": gui_code,
+                        "vnv-gui-code": container.code,
                     },
                     name=container.id,
                     ports={5000: None},
@@ -289,6 +290,7 @@ class ContainerImplementation:
 
     @classmethod
     def delete_(cls, container_id, uid):
+
         c = cls.get_container(container_id, uid)
         if c is not None:
             try:
@@ -297,19 +299,17 @@ class ContainerImplementation:
                     a.stop(timeout=0)
                     a.remove(force=True, v=False)
                 else:
-                    d.status = "CHECK"
-                    d.error = "Underlying Docker Container is missing"
+                    c.dstatus = "CHECK"
+                    c.error = "Underlying Docker Container is missing"
                 
                 CONTAINER_CACHE.pop(container_id)
-                return True
-     
+
             except:
                 pass
 
             c.dstatus = "CHECK"
             c.error = "Could not delete container"
             
-        return False
 
     @classmethod
     def snapshot_(cls,ref, container_id, uid, kwargs):
@@ -406,6 +406,7 @@ def create_container():
         tag = j.pop("tag", "latest")
         name = j.pop("name", "Untitled")
         desc = j.pop("desc", "No Description")
+        code = j.pop("code", uuid.uuid4().hex)
 
 
         extra = dict(
@@ -418,7 +419,7 @@ def create_container():
         if cont is not None:
             return make_response("Error: Container Id already exists", 201)        
 
-        container = Container(container_id, g.user, name=name, repo=repo, desc=desc, tag=tag)
+        container = Container(container_id, g.user, name=name, repo=repo, desc=desc, tag=tag, code=code)
         CONTAINER_CACHE[container_id] = container
         container.dstatus = "creating"
         threading.Thread(target=ContainerImplementation.create_,
@@ -472,7 +473,7 @@ def delete_container(cid):
         if container is not None and container.user == g.user:
             container.dstatus = "deleting"
             threading.Thread(target=ContainerImplementation.delete_, args=[cid, g.user]).start()
-            return make_response("", 200)
+            return make_response(ref, 200)
     except:
         pass
 
@@ -537,7 +538,7 @@ def download_gui_image(gui_image):
     
 if __name__ == "__main__":
 
-    DEFAULT_GUI_IMAGE = os.getenv("VNV_GUI_IMAGE", "ghcr.io/vnvlabs/gui:latest")
+    DEFAULT_GUI_IMAGE = os.getenv("VNV_GUI_IMAGE", "ghcr.io/vnvlabs/gui:v1.0.1")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, help="port to run on (default 5001)", default=5000)
@@ -549,7 +550,7 @@ if __name__ == "__main__":
     parser.add_argument("--ssl_key", type=str, help="file containing the ssl cert key", default=None)
     parser.add_argument("--wspath", type=str, help="web socket path", default=None)
     parser.add_argument("--theiapath", type=str, help="web socket path", default=None)
-    parser.add_argument("--wrapper", type=str, help="path to the dockerfile that wraps the gui.", default="/dockerm/wrap")
+    parser.add_argument("--wrapper", type=str, help="path to the dockerfile that wraps the gui.", default="./wrap")
     parser.add_argument("--image", type=str, help="image name for the vnv gui to use during wrapping", default=DEFAULT_GUI_IMAGE)
 
     args = parser.parse_args()
