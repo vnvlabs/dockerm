@@ -102,6 +102,20 @@ class Container:
 class ContainerImplementation:
     docker_client = docker.from_env()
 
+    @classmethod
+    def configureUserDatabase(cls,userId, size=1000):
+        try:
+            vol = cls.docker_client.volumes.get("vol-" + userId)
+        except:
+            vol = cls.docker_client.volumes.create("vol-" + userId,
+                                                   driver="local",
+                                                   driver_opts={
+                                                       "type": "tmpfs",
+                                                       "device": "tmpfs",
+                                                       "o": f"size={size}m,uid=1000"
+                                                   })
+        return "vol-" + userId
+
     ### Load all containers available inside the environment 
     @classmethod
     def load_all(cls):
@@ -234,8 +248,9 @@ class ContainerImplementation:
                     detach=True
                 )
 
-                if len( config["DATABASE"]) > 0:
-                    opts["volumes"] = [config["DATABASE"]]
+                if config["DATABASE"]:
+                    vol = cls.configureUserDatabase(container.user, size=config["DATABASE_SIZE"])
+                    opts["volumes"] = [f"{vol}:{config['DATABASE_DIR']}"]
 
                 container.error = "Launching Container"
                 cls.docker_client.containers.run(run_image, **opts)
@@ -473,7 +488,7 @@ def delete_container(cid):
         if container is not None and container.user == g.user:
             container.dstatus = "deleting"
             threading.Thread(target=ContainerImplementation.delete_, args=[cid, g.user]).start()
-            return make_response(ref, 200)
+            return make_response("ref", 200)
     except:
         pass
 
@@ -513,7 +528,9 @@ class Config:
     SSL = False
     SSL_DIR = "tmp_ssl_dir"
     SSLCTX = (os.path.join(SSL_DIR, "cert.crt"), os.path.join(SSL_DIR, "cert.key"))
-    DATABASE = ""
+    DATABASE = True
+    DATABASE_SIZE = 1000
+    DATABASE_DIR="/vnv-shared"
     WSPATH = None
     THEIAPATH = None
     DOCKERFILEWRAP = ""
@@ -545,7 +562,9 @@ if __name__ == "__main__":
     parser.add_argument("--host", help="host to run on (default localhost)", default="0.0.0.0")
     parser.add_argument("--code", type=str, help="authorization-code", default="secret")
     parser.add_argument("--ssl", type=bool, help="should we use ssl", default=False)
-    parser.add_argument("--database", type=str, help="database mounting url for launching docker containers.", default="")
+    parser.add_argument("--database", type=bool, help="should we provide the users a database", default=True)
+    parser.add_argument("--database-size", type=int, help="size of the database in mb", default=200)
+    parser.add_argument("--database-dir", type=str, help="mount directory for database", default="/vnv-shared")
     parser.add_argument("--ssl_cert", type=str, help="file containing the ssl cert", default=None)
     parser.add_argument("--ssl_key", type=str, help="file containing the ssl cert key", default=None)
     parser.add_argument("--wspath", type=str, help="web socket path", default=None)
@@ -559,6 +578,9 @@ if __name__ == "__main__":
     Config.AUTHCODE = args.code
     Config.SSL = args.ssl
     Config.DATABASE = args.database
+    Config.DATABASE_SIZE = args["database-size"]
+    Config.DATABASE_DIR = args["database-dir"]
+
     Config.DOCKERFILEWRAP = args.wrapper
     Config.GUI_IMAGE = args.image
     Config.WSPATH = args.wspath
