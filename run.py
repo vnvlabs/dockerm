@@ -11,6 +11,7 @@ import uuid
 from io import StringIO, BytesIO
 from threading import Thread
 import requests
+from docker.errors import APIError
 from flask import Blueprint, request, make_response, jsonify, g, Flask, current_app
 import docker
 
@@ -29,8 +30,6 @@ IMAGE_PORT = 5000
 
 # Little cache to keep state in while we update stuff.
 CONTAINER_CACHE = {}
-
-
 
 
 def benc(msg):
@@ -62,7 +61,7 @@ class Container:
             try:
                 a = ContainerImplementation.docker_client.containers.get(self.id)
                 if a is not None:
-                    return a.status #  created, restarting, running, removing, paused, exited, dead
+                    return a.status  # created, restarting, running, removing, paused, exited, dead
 
             except Exception as e:
                 pass
@@ -82,7 +81,7 @@ class Container:
             "dstatus": self.dstatus,
             "status": self.status(),
             "description": self.desc,
-            "error" : self.error
+            "error": self.error
         }
 
     @staticmethod
@@ -93,30 +92,53 @@ class Container:
                          repo=j["repo"],
                          tag=j["tag"],
                          code=j["code"],
-                         dstatus = j["dstatus"],
+                         dstatus=j["dstatus"],
                          desc=j["description"],
                          error=j["error"]
                          )
+
+
+def parseContainer_kwargs(containerKwargs):
+    res = {}
+    if containerKwargs is not None:
+        if "cpu" in containerKwargs and containerKwargs["cpu"] > 0 :
+            res["cpu_period"] = 100000
+            res["cpu_quota"] = containerKwargs["cpu"]*100000
+        if "memory" in containerKwargs and containerKwargs["memory"] > 0:
+            res["mem_limit"] = str(containerKwargs["memory"]) + "g"
+        if "gpu" in containerKwargs and containerKwargs["gpu"] != 0:
+            res["device_requests"] =[
+                docker.types.DeviceRequest(count=containerKwargs["gpu"], capabilities=[['gpu']])
+            ]
+
+    return res
 
 
 class ContainerImplementation:
     docker_client = docker.from_env()
 
     @classmethod
-    def configureUserDatabase(cls,userId, size=1000):
+    def configureUserDatabase(cls, userId, config):
+
+        def local_volume(config):
+            return dict(name="vol-" + userId,
+                        driver="local",
+                        driver_opts={
+                            "type": "tmpfs",
+                            "device": "tmpfs",
+                            "o": f"size={config['DATABASE_SIZE']}m,uid=1000"
+                        })
+
+        DBS = {"local": local_volume}
+
         try:
-            vol = cls.docker_client.volumes.get("vol-" + userId)
+            cls.docker_client.volumes.get("vol-" + userId)
         except:
-            vol = cls.docker_client.volumes.create("vol-" + userId,
-                                                   driver="local",
-                                                   driver_opts={
-                                                       "type": "tmpfs",
-                                                       "device": "tmpfs",
-                                                       "o": f"size={size}m,uid=1000"
-                                                   })
+            cls.docker_client.volumes.create(**DBS["local"](config))
+
         return "vol-" + userId
 
-    ### Load all containers available inside the environment 
+    ### Load all containers available inside the environment
     @classmethod
     def load_all(cls):
         docker_containers = cls.docker_client.containers.list(all=True, filters={"label": "vnv-container-info"})
@@ -137,14 +159,14 @@ class ContainerImplementation:
         try:
             if "private" in kwargs and kwargs["private"]:
                 auth_config = {
-                    "username" :kwargs.get("username"),
-                    "password" : kwargs.get("passw")
+                    "username": kwargs.get("username"),
+                    "password": kwargs.get("passw")
                 }
                 return cls.docker_client.images.pull(repository=repo, tag=tag, auth_config=auth_config)
 
             return cls.docker_client.images.pull(repository=repo, tag=tag)
         except Exception as e:
-            #Try find it locally.
+            # Try find it locally.
             return cls.docker_client.images.get(repo + ":" + (tag if tag is not None else "latest"))
 
     @classmethod
@@ -158,17 +180,17 @@ class ContainerImplementation:
     @classmethod
     def wrap_image(cls, run_image, config, container):
         try:
-                gui_code = uuid.uuid4().hex
-                ri = f"wrapped-{gui_code}"                
-                cls.docker_client.images.build(
-                    path=config["DOCKERFILEWRAP"],
-                    tag=ri, 
-                    buildargs = {
-                        "FROM_IMAGE" : run_image,
-                        "GUI_IMAGE" : config["GUI_IMAGE"],
-                    }
-                )
-                return ri
+            gui_code = uuid.uuid4().hex
+            ri = f"wrapped-{gui_code}"
+            cls.docker_client.images.build(
+                path=config["DOCKERFILEWRAP"],
+                tag=ri,
+                buildargs={
+                    "FROM_IMAGE": run_image,
+                    "GUI_IMAGE": config["GUI_IMAGE"],
+                }
+            )
+            return ri
         except Exception as e:
             print(e)
             raise Exception("Failed to wrap image: " + str(e))
@@ -181,7 +203,7 @@ class ContainerImplementation:
             return None
 
     @classmethod
-    def create_(cls, container, imageKwargs, config):
+    def create_(cls, container, imageKwargs, containerKwargs, config):
 
         try:
             container.error = "Downloading Image"
@@ -191,15 +213,15 @@ class ContainerImplementation:
                 image = None
 
             if image is not None:
-              
+
                 container.error = "Configuring Container"
-                run_image =  container.repo + (":" + container.tag) if container.tag is not None else ""
+                run_image = container.repo + (":" + container.tag) if container.tag is not None else ""
                 ssl_opts = ""
 
-                #Build in the SSL Configuration 
+                # Build in the SSL Configuration
                 if config['SSL']:
                     container.error = "Configuring SSL "
-                   
+
                     with open(os.path.abspath(config["SSLCTX"][0])) as f:
                         crt = f.readlines()
                     with open(os.path.abspath(config["SSLCTX"][1])) as f:
@@ -220,23 +242,23 @@ class ContainerImplementation:
                         s.write(str.encode(ss))
                     s.write(b"' > /certs/cert.key\n")
 
-                    #Update the run image to this new image and build it. 
+                    # Update the run image to this new image and build it.
                     run_image = f"vci-{container.id}"
                     ssl_opts = f" --ssl 1 --ssl_cert /certs/cert.crt --ssl_key /certs/cert.key"
                     cls.docker_client.images.build(fileobj=s, tag=run_image)
-                
-                #Wrap the GUI into this thing. 
+
+                # Wrap the GUI into this thing.
                 if image.labels.get("VNV_GUI_EQUIPT") is None:
-                   container.error = "Installing VnV Toolkit GUI"
-                   run_image = cls.wrap_image(run_image, config, container)
-                        
+                    container.error = "Installing VnV Toolkit GUI"
+                    run_image = cls.wrap_image(run_image, config, container)
+
                 wsp = ""
                 if config["WSPATH"] is not None:
                     wsp = "--wspath " + config["WSPATH"] + " "
-                
+
                 if config["THEIAPATH"] is not None:
-                    wsp += "--theiapath" + config["THEIAPATH"] + " "   
- 
+                    wsp += "--theiapath" + config["THEIAPATH"] + " "
+
                 opts = dict(
                     command=f"/vnv-gui/launch.sh --code {container.code} {wsp} {ssl_opts} ",
                     labels={
@@ -245,11 +267,12 @@ class ContainerImplementation:
                     },
                     name=container.id,
                     ports={5000: None},
-                    detach=True
+                    detach=True,
+                    **parseContainer_kwargs(containerKwargs)
                 )
 
                 if config["DATABASE"]:
-                    vol = cls.configureUserDatabase(container.user, size=config["DATABASE_SIZE"])
+                    vol = cls.configureUserDatabase(container.user, config)
                     opts["volumes"] = [f"{vol}:{config['DATABASE_DIR']}"]
 
                 container.error = "Launching Container"
@@ -259,7 +282,9 @@ class ContainerImplementation:
             else:
                 container.dstatus = "error"
                 container.error = "Image not found"
-
+        except APIError as e:
+            container.dstatus = "error"
+            container.error = f"{e.explanation}"
         except Exception as e:
             container.dstatus = "error"
             container.error = str(e)
@@ -268,7 +293,7 @@ class ContainerImplementation:
     def stop_(cls, container_id, uid):
         c = cls.get_container(container_id, uid)
         if c is not None:
-    
+
             try:
                 dc = cls.get_docker_container(container_id)
                 if dc is not None:
@@ -279,12 +304,12 @@ class ContainerImplementation:
             except:
                 pass
 
-            c.error="Could Not Stop Container."
+            c.error = "Could Not Stop Container."
             c.dstatus = "CHECK"
             return False
-        
+
         return False
-        
+
     @classmethod
     def start_(cls, container_id, uid):
         c = cls.get_container(container_id, uid)
@@ -316,7 +341,7 @@ class ContainerImplementation:
                 else:
                     c.dstatus = "CHECK"
                     c.error = "Underlying Docker Container is missing"
-                
+
                 CONTAINER_CACHE.pop(container_id)
 
             except:
@@ -324,13 +349,12 @@ class ContainerImplementation:
 
             c.dstatus = "CHECK"
             c.error = "Could not delete container"
-            
 
     @classmethod
-    def snapshot_(cls,ref, container_id, uid, kwargs):
-        
+    def snapshot_(cls, ref, container_id, uid, kwargs):
+
         c = cls.get_container(container_id, uid)
-        repo = kwargs.pop("repo",None)
+        repo = kwargs.pop("repo", None)
         tag = kwargs.pop("tag", None)
         if c is None or repo is None or tag is None:
             REFS[ref] = "Invalid Repo,tag or container"
@@ -347,14 +371,14 @@ class ContainerImplementation:
                 a = cls.docker_client.images.push(repo, tag=tag, auth_config={
                     "username": kwargs.get("username"),
                     "password": kwargs.get("password")
-                }, decode = True, stream=True)
+                }, decode=True, stream=True)
 
                 success = True
                 REFS[ref] = "Pending"
                 for i in a:
                     if "errorDetail" in i:
                         REFS[ref] = "Failed: " + i["errorDetail"]["message"]
-                        success=False
+                        success = False
                 if success:
                     REFS[ref] = "Success"
 
@@ -373,10 +397,11 @@ class ContainerImplementation:
         if c is not None:
             container = cls.get_docker_container(container_id)
             if container is not None:
-                return container.ports[f"{IMAGE_PORT}/tcp"][0]["HostPort"], {"vnv-gui-code": container.labels["vnv-gui-code"]}
+                return container.ports[f"{IMAGE_PORT}/tcp"][0]["HostPort"], {
+                    "vnv-gui-code": container.labels["vnv-gui-code"]}
             raise Exception("Docker container does not exist")
         raise Exception("Container ID does not exist")
-        
+
     @classmethod
     def list_containers(cls, uid):
         containers = []
@@ -390,13 +415,13 @@ class ContainerImplementation:
 
 
 @blueprint.before_request
-def check_valid_login():    
+def check_valid_login():
     g.user = request.cookies.get("vnv-resource-user")
     if g.user is None:
         return make_response("Error No user name provided", 201)
     if request.cookies.get("vnv-resource-auth") != current_app.config["AUTHCODE"]:
         return make_response("Error: Incorrect Authorization Code", 201)
-    
+
 
 @blueprint.route("/ready", methods=["GET"])
 def ready():
@@ -411,7 +436,6 @@ def container_management():
     return make_response(jsonify(r), 200)
 
 
-
 @blueprint.route('/create', methods=["POST"])
 def create_container():
     try:
@@ -423,22 +447,23 @@ def create_container():
         desc = j.pop("desc", "No Description")
         code = j.pop("code", uuid.uuid4().hex)
 
-
         extra = dict(
             private=j.get("private", False),
-            username = j.get("username", None),
-            password = j.get("password", None)
+            username=j.get("username", None),
+            password=j.get("password", None)
         )
+
+        advanced = j.get("advanced")
 
         cont = ContainerImplementation.get_container(container_id, g.user)
         if cont is not None:
-            return make_response("Error: Container Id already exists", 201)        
+            return make_response("Error: Container Id already exists", 201)
 
         container = Container(container_id, g.user, name=name, repo=repo, desc=desc, tag=tag, code=code)
         CONTAINER_CACHE[container_id] = container
         container.dstatus = "creating"
         threading.Thread(target=ContainerImplementation.create_,
-                         args=[container,  extra, current_app.config ]).start()
+                         args=[container, extra, advanced, current_app.config]).start()
 
         return make_response(container_id, 200)
     except Exception as e:
@@ -447,7 +472,7 @@ def create_container():
 
 @blueprint.route('/status/<cid>', methods=["GET"])
 def container_status(cid):
-    container= ContainerImplementation.get_container(cid, g.user)
+    container = ContainerImplementation.get_container(cid, g.user)
     if container is not None:
         return make_response(jsonify(container.to_json()), 200)
     else:
@@ -494,9 +519,11 @@ def delete_container(cid):
 
     return make_response("", 201)
 
+
 @blueprint.route('/ref/<cid>', methods=["POST"])
 def get_ref(cid):
-    return make_response(REFS.get(cid,"Not Found"),200)
+    return make_response(REFS.get(cid, "Not Found"), 200)
+
 
 @blueprint.route('/port/<cid>', methods=["POST"])
 def get_container_port(cid):
@@ -520,7 +547,6 @@ def create_image(cid):
 
 
 class Config:
-
     DEBUG = False
     port = 5010
     HOST = "0.0.0.0"
@@ -530,21 +556,22 @@ class Config:
     SSLCTX = (os.path.join(SSL_DIR, "cert.crt"), os.path.join(SSL_DIR, "cert.key"))
     DATABASE = True
     DATABASE_SIZE = 1000
-    DATABASE_DIR="/vnv-shared"
+    DATABASE_DIR = "/vnv-shared"
     WSPATH = None
     THEIAPATH = None
     DOCKERFILEWRAP = ""
     GUI_IMAGE = ""
-    
+
+
 ContainerImplementation.load_all()
 
-def download_gui_image(gui_image): 
-    
+
+def download_gui_image(gui_image):
     rr = gui_image.split(":")
     repo = rr[0]
     tag = rr[1] if len(rr) == 2 else "latest"
     try:
-        docker.from_env().images.pull(repo,tag=tag)
+        docker.from_env().images.pull(repo, tag=tag)
     except Exception as e:
         try:
             docker.from_env().images.get(gui_image)
@@ -552,7 +579,8 @@ def download_gui_image(gui_image):
             print(f"Warning: Could not pull gui image {e}")
             print(f"Warning: Image does not exist locally: {ee}")
     print("GUI Image Update Complete")
-    
+
+
 if __name__ == "__main__":
 
     DEFAULT_GUI_IMAGE = os.getenv("VNV_GUI_IMAGE", "ghcr.io/vnvlabs/gui:v1.0.1")
@@ -563,14 +591,15 @@ if __name__ == "__main__":
     parser.add_argument("--code", type=str, help="authorization-code", default="secret")
     parser.add_argument("--ssl", type=bool, help="should we use ssl", default=False)
     parser.add_argument("--database", type=bool, help="should we provide the users a database", default=True)
-    parser.add_argument("--database-size", type=int, help="size of the database in mb", default=200)
-    parser.add_argument("--database-dir", type=str, help="mount directory for database", default="/vnv-shared")
+    parser.add_argument("--database_size", type=int, help="size of the database in mb", default=200)
+    parser.add_argument("--database_dir", type=str, help="mount directory for database", default="/vnv-shared")
     parser.add_argument("--ssl_cert", type=str, help="file containing the ssl cert", default=None)
     parser.add_argument("--ssl_key", type=str, help="file containing the ssl cert key", default=None)
     parser.add_argument("--wspath", type=str, help="web socket path", default=None)
     parser.add_argument("--theiapath", type=str, help="web socket path", default=None)
     parser.add_argument("--wrapper", type=str, help="path to the dockerfile that wraps the gui.", default="./wrap")
-    parser.add_argument("--image", type=str, help="image name for the vnv gui to use during wrapping", default=DEFAULT_GUI_IMAGE)
+    parser.add_argument("--image", type=str, help="image name for the vnv gui to use during wrapping",
+                        default=DEFAULT_GUI_IMAGE)
 
     args = parser.parse_args()
     Config.port = args.port
@@ -578,20 +607,19 @@ if __name__ == "__main__":
     Config.AUTHCODE = args.code
     Config.SSL = args.ssl
     Config.DATABASE = args.database
-    Config.DATABASE_SIZE = args["database-size"]
-    Config.DATABASE_DIR = args["database-dir"]
+    Config.DATABASE_SIZE = args.database_size
+    Config.DATABASE_DIR = args.database_dir
 
     Config.DOCKERFILEWRAP = args.wrapper
     Config.GUI_IMAGE = args.image
     Config.WSPATH = args.wspath
     Config.THEIAPATH = args.theiapath
-    
 
     app_config = Config()
-        
-    thread = Thread(target=download_gui_image, args=(Config.GUI_IMAGE,) )
+
+    thread = Thread(target=download_gui_image, args=(Config.GUI_IMAGE,))
     thread.start()
-    
+
     app = Flask(__name__, static_folder="static")
     app.config.from_object(app_config)
     app.register_blueprint(blueprint)
@@ -609,6 +637,5 @@ if __name__ == "__main__":
         shutil.copy(args.ssl_cert, Config.SSLCTX[0])
         shutil.copy(args.ssl_key, Config.SSLCTX[1])
         opts["ssl_context"] = Config.SSLCTX
-
 
     app.run(**opts)
