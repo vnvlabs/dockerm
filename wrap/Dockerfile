@@ -18,10 +18,10 @@ ENV DOWNLOAD_PARAVIEW=1
 COPY --from=0 /vnvgui/node /vnvgui/node
 COPY --from=0 /vnvgui/theia /vnvgui/theia
 COPY --from=0 /vnvgui/gui /vnvgui/gui
+COPY --from=0 /vnvgui/paraview /vnvgui/paraview 
 
-RUN apt-get -y update && apt-get install -y python3-dev python3-pip libsecret-1-dev && pip3 install virtualenv
+RUN apt-get -y update && apt-get install -y python3-dev python3-pip libsecret-1-dev wget curl git libglapi-mesa && pip3 install virtualenv
 RUN cd /vnvgui/gui && virtualenv virt && virt/bin/pip install -r ./requirements.txt 
-
 LABEL VNV_GUI_EQUIPT=1
 
 WORKDIR /vnvgui/gui
